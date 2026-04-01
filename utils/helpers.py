@@ -22,7 +22,8 @@ _FIND_SRC = (
     r"\( -name '*.py' -o -name '*.java' -o -name '*.js' -o -name '*.jsx' "
     r"-o -name '*.ts' -o -name '*.tsx' -o -name '*.go' -o -name '*.rs' "
     r"-o -name '*.rb' -o -name '*.php' -o -name '*.c' -o -name '*.cpp' "
-    r"-o -name '*.h' -o -name '*.cs' -o -name '*.kt' -o -name '*.scala' \) "
+    r"-o -name '*.h' -o -name '*.cs' -o -name '*.kt' -o -name '*.scala' "
+    r"-o -name '*.swift' \) "
     r"! -path '*/.git/*' ! -path '*/node_modules/*' "
     r"! -path '*/venv/*' ! -path '*/__pycache__/*' "
     r"! -path '*/dist/*' ! -path '*/build/*' ! -path '*/target/*'"
@@ -78,7 +79,7 @@ def strip_fences(text: str) -> str:
 # Repository exploration
 # ──────────────────────────────────────────────────────────────────────────────
 
-def list_source_files(repo_dir: str, max_files: int = 80) -> list:
+def list_source_files(repo_dir: str, max_files: int = 120) -> list:
     """Return relative paths of source files in the repo (all languages)."""
     out = shell(f"{_FIND_SRC} | sort | head -{max_files}", cwd=repo_dir)
     return [
@@ -131,7 +132,7 @@ def git_recently_changed(repo_dir: str, n_commits: int = 8) -> list:
     """Return source files touched in the last n commits (likely buggy ones)."""
     out = shell(
         f"git log --name-only --pretty=format: -n {n_commits} 2>/dev/null "
-        r"| grep -E '\.(py|java|js|jsx|ts|tsx|go|rs|rb|php|c|cpp|h|cs|kt|scala)$' "
+        r"| grep -E '\.(py|java|js|jsx|ts|tsx|go|rs|rb|php|c|cpp|h|cs|kt|scala|swift)$' "
         "| sort -u | head -20",
         cwd=repo_dir,
     )
@@ -144,10 +145,10 @@ def git_recently_changed(repo_dir: str, n_commits: int = 8) -> list:
 
 def grep_keywords(prompt: str, repo_dir: str) -> str:
     """
-    Extract identifiers from the first 4 lines of the issue and grep
+    Extract identifiers from the first 30 lines of the issue and grep
     for them across ALL source files (not just *.py — critical for Java/JS/TS).
     """
-    first_lines = " ".join(prompt.splitlines()[:4])
+    first_lines = " ".join(prompt.splitlines()[:30])
     camel = re.findall(r"\b[A-Z][a-zA-Z0-9]{3,}\b", first_lines)[:4]
     snake = re.findall(r"\b[a-z_][a-z0-9_]{4,}\b", first_lines)[:3]
     keywords = list(dict.fromkeys(camel + snake))
@@ -288,14 +289,27 @@ def validate_patch_syntax(patch: str, repo_dir: str) -> tuple:
     """
     Dry-run git apply --check. Writes patch inside repo_dir (within task dir).
     Returns (ok: bool, error_message: str).
+    Uses process exit code instead of string matching to avoid false positives
+    from comments/messages that happen to contain the word "error".
     """
     patch_path = os.path.join(repo_dir, ".agent_validate.patch")
     try:
         with open(patch_path, "w", encoding="utf-8") as f:
             f.write(patch)
-        result = shell(f"git apply --check {patch_path} 2>&1", cwd=repo_dir, timeout=10)
-        ok = "error" not in result.lower() and "failed" not in result.lower()
-        return ok, result
+        result = subprocess.run(
+            ["git", "apply", "--check", patch_path],
+            capture_output=True,
+            text=True,
+            cwd=repo_dir,
+            timeout=10,
+        )
+        ok = result.returncode == 0
+        err = (result.stdout + result.stderr).strip()
+        return ok, err
+    except subprocess.TimeoutExpired:
+        return False, "[git apply --check timed out]"
+    except Exception as exc:
+        return False, f"[validation error: {exc}]"
     finally:
         try:
             os.unlink(patch_path)

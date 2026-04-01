@@ -52,16 +52,34 @@ litellm.set_verbose = False
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _model() -> str:
-    return os.environ.get("CHUTES_MODEL", "chutes/moonshotai/Kimi-K2.5-TEE")
+    m = os.environ.get("CHUTES_MODEL", "")
+    if not m:
+        raise RuntimeError("CHUTES_MODEL environment variable is not set.")
+    # Enforce platform rule: all models must use the -TEE suffix
+    if not m.endswith("-TEE"):
+        raise RuntimeError(
+            f"Model '{m}' does not have the required -TEE suffix. "
+            "CHUTES_MODEL must be a TEE model (e.g. chutes/moonshotai/Kimi-K2.5-TEE)."
+        )
+    return m
 
 def _api_key() -> str:
+    # When the validator injects LLM_PROXY_URL, auth is handled by the proxy itself
+    if os.environ.get("LLM_PROXY_URL"):
+        return os.environ.get("CHUTES_API_KEY", "")
     key = os.environ.get("CHUTES_API_KEY", "")
     if not key:
         raise RuntimeError("CHUTES_API_KEY environment variable is not set.")
     return key
 
 def _api_base() -> str:
-    return os.environ.get("CHUTES_API_BASE", "https://llm.chutes.ai/v1")
+    # LLM_PROXY_URL is injected by the validator during evaluation;
+    # it proxies through to llm.chutes.ai — still Chutes-only compliant.
+    base = (os.environ.get("LLM_PROXY_URL")
+            or os.environ.get("CHUTES_API_BASE", ""))
+    if not base:
+        raise RuntimeError("CHUTES_API_BASE environment variable is not set.")
+    return base
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LLM wrapper
@@ -102,7 +120,7 @@ _ANALYST_TMPL = """\
 You are a senior {lang} software engineer triaging a bug report.
 
 Given a bug description, the repository file tree, and clues about which files
-are involved, identify the 4-8 files most likely to contain the bug or need changes.
+are involved, identify the 4-10 files most likely to contain the bug or need changes.
 
 Prefer implementation files over configuration. Include test files only if the
 fix is in the test itself.
@@ -203,14 +221,15 @@ def _chars_per_file(num_files: int) -> int:
     """
     Limit chars-per-file to keep total context bounded as selection grows.
     Fewer files → more chars each (more context for hard single-file bugs).
+    Limits raised to reduce chance of truncating the buggy code section.
     """
     if num_files <= 2:
-        return 16000
+        return 24000
     if num_files <= 4:
-        return 10000
+        return 14000
     if num_files <= 6:
-        return 7000
-    return 5000
+        return 10000
+    return 7000
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline helpers
@@ -233,7 +252,7 @@ def _identify_files(
         ctx += f"\n\n## test.sh\n```bash\n{test_content}\n```"
     if extra_context:
         ctx += f"\n\n{extra_context}"
-    ctx += "\n\nOutput a JSON array of the 4-8 most relevant file paths."
+    ctx += "\n\nOutput a JSON array of the 4-10 most relevant file paths."
 
     system = _ANALYST_TMPL.format(lang=lang)
     reply = _chat(
@@ -328,7 +347,7 @@ def _select_files(
     if not selected:
         selected = all_files[:8]
 
-    return selected[:10], combined_grep
+    return selected[:14], combined_grep
 
 
 def _build_fixer_prompt(
@@ -378,6 +397,7 @@ def _fix_files(
     grep_hits: str,
     lang: str,
     framework: str,
+    temperature: float = 0.2,
 ) -> dict:
     """
     Ask the LLM to return complete fixed file contents (ReAct: THINK then FIX).
@@ -387,8 +407,8 @@ def _fix_files(
     system = _FIXER_TMPL.format(lang=lang)
     reply = _chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-        max_tokens=8192,
-        temperature=0.2,
+        max_tokens=12288,
+        temperature=temperature,
     )
     return _parse_file_sections(reply)
 
@@ -485,6 +505,9 @@ def solve(task_dir: str) -> str:
         A unified git diff that applies cleanly to buggy/ with `git apply`.
     """
     # ── 1. Read task ─────────────────────────────────────────────────────────
+    task_id = os.environ.get("TERM_TASK_ID", "")
+    eval_mode = os.environ.get("EVALUATION_MODE", "").lower() == "true"
+    _log(f"task_id  : {task_id or '(local)'} | eval={eval_mode}")
     _log(f"task_dir : {task_dir}")
     issue = read_file(os.path.join(task_dir, "prompt.md"))
     buggy_dir = os.path.join(task_dir, "buggy")
@@ -530,12 +553,16 @@ def solve(task_dir: str) -> str:
     # ── 6. Ask LLM to fix (THINK then FIX — guide: ReAct pattern) ────────────
     _log("step 3/4 : asking LLM to fix files (THINK → FIX)...")
     file_pairs = list(originals.items())
+    # In evaluation mode the validator runs the full checkpoint — use deterministic
+    # temperature to maximise reproducibility and avoid luck-dependent passes.
+    fix_temp = 0.1 if eval_mode else 0.2
     fixes = _fix_files(
         issue, file_pairs,
         test_info.get("content", ""),
         grep_hits,
         lang,
         test_info.get("framework", "unknown"),
+        temperature=fix_temp,
     )
 
     # Hard retry if LLM returned no === FILE === blocks at all
@@ -575,13 +602,17 @@ def solve(task_dir: str) -> str:
         if not patch.strip():
             _log(f"          attempt {attempt + 1}: empty patch")
             if attempt < MAX_ATTEMPTS - 1:
-                _log("          LLM returned identical content — forcing a fix...")
+                # Raise temperature to explore different solutions — same prompt
+                # at the same temp will produce the same empty result.
+                higher_temp = 0.4 + attempt * 0.2
+                _log(f"          LLM returned identical content — retrying at temperature={higher_temp:.1f}...")
                 forced = _fix_files(
                     issue, file_pairs,
                     test_info.get("content", ""),
                     grep_hits,
                     lang,
                     test_info.get("framework", "unknown"),
+                    temperature=higher_temp,
                 )
                 if forced:
                     current_fixes = _normalize_fixes(forced, originals)
